@@ -1,3 +1,4 @@
 python
 .env
 .DS_Store
+synthagent.log

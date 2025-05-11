@@ -5,6 +5,7 @@ This module implements a system that queries multiple language models in paralle
 and then synthesizes their responses into a cohesive answer.
 """
 import os
+import sys
 import time
 import asyncio
 import logging
@@ -17,91 +18,88 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.prompt import Prompt
+from rich.panel import Panel
+from rich.text import Text
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.FileHandler("synthagent.log", mode="w")]
 )
-
-for logger_name in ["openai", "httpx", "urllib3", "openai.http_client"]:
-    logging.getLogger(logger_name).setLevel(logging.ERROR)
-
-logger = logging.getLogger(__name__)
-
-
-load_dotenv()
-
-API_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-SYNTHESIZER_MODEL = "qwen/qwen3-235b-a22b:free"
+logger = logging.getLogger("synthagent")
 
 console = Console()
 
+load_dotenv()
+
+API_BASE_URL = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+SYNTHESIZER_MODEL = os.getenv("SYNTHESIZER_MODEL", "qwen/qwen3-235b-a22b:free")
+
+REQUIRED_ENV_VARS = ["OPENROUTER_API_KEY"]
+
+class SynthAgentConfigError(Exception):
+    """Raised when there is a configuration error in SynthAgent."""
+    pass
+
 class SynthModel(BaseModel):
-    """Model configuration for a language model to query"""
+    """Model configuration for a language model to query."""
     name: str
     runs: int = Field(default=1, ge=1, description="Number of times to run this model")
 
     class Config:
         frozen = True
 
-
 class SynthModelResult(BaseModel):
-    """Result from a language model query"""
+    """Result from a language model query."""
     name: str
     result: str = ""
     error: Optional[str] = None
     processing_time: Optional[float] = None
 
+def validate_env() -> None:
+    """Ensure all required environment variables are set."""
+    missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+    if missing:
+        msg = f"Missing required environment variables: {', '.join(missing)}"
+        logger.critical(msg)
+        console.print(Panel(Text(msg, style="bold red"), title="[red]Configuration Error"))
+        sys.exit(1)
+
+def get_default_models() -> List[SynthModel]:
+    """Return a default list of models to use."""
+    return [
+        SynthModel(name="qwen/qwen3-30b-a3b:free", runs=5),
+        SynthModel(name="google/gemini-2.5-pro-preview", runs=5),
+        SynthModel(name="deepseek/deepseek-chat-v3-0324", runs=5),
+    ]
 
 async def process_model(model: SynthModel, client: AsyncOpenAI, query: str) -> SynthModelResult:
-    """Process a single model asynchronously
-
-    Args:
-        model: The model configuration
-        client: The OpenAI client to use for queries
-        query: The user query to process
-
-    Returns:
-        A SynthModelResult with the model response or error information
-    """
+    """Process a single model asynchronously."""
     logger.info(f"Processing model - {model.name}")
     start_time = time.time()
-
     try:
         response = await client.chat.completions.create(
             model=model.name,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant"
-                },
-                {
-                    "role": "user",
-                    "content": query
-                }
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": query}
             ],
         )
-
         result = response.choices[0].message.content
-
         if result is None:
             raise ValueError(f"Received null response from model: {model.name}")
-
         processing_time = time.time() - start_time
         logger.info(f"Successfully processed model: {model.name} in {processing_time:.2f}s")
-
         return SynthModelResult(
             name=model.name,
             result=result,
             processing_time=processing_time
         )
-
     except Exception as e:
         processing_time = time.time() - start_time
         logger.error(f"Error processing model {model.name}: {str(e)}")
-
         return SynthModelResult(
             name=model.name,
             result=f"ERROR: {str(e)}",
@@ -109,47 +107,24 @@ async def process_model(model: SynthModel, client: AsyncOpenAI, query: str) -> S
             processing_time=processing_time
         )
 
-
 class SynthAgent:
-    """Agent that synthesizes responses from multiple language models"""
-
-    def __init__(self, models: List[SynthModel]):
-        """Initialize the agent with a list of models
-
-        Args:
-            models: List of SynthModel configurations to use
-        """
+    """Agent that synthesizes responses from multiple language models."""
+    def __init__(self, models: List[SynthModel], api_key: str, api_base: str = API_BASE_URL):
         if not models:
-            raise ValueError("At least one model must be provided")
-
+            raise SynthAgentConfigError("At least one model must be provided.")
         self.models = models
-        self.client = AsyncOpenAI(
-            base_url=API_BASE_URL,
-            api_key=OPENROUTER_API_KEY,
-        )
+        self.client = AsyncOpenAI(base_url=api_base, api_key=api_key)
 
     async def synthesize_async(self, query: str) -> Optional[AsyncStream[ChatCompletionChunk]]:
-        """Synthesize responses from multiple models
-
-        Args:
-            query: The user query to process
-
-        Returns:
-            A synthesized response or None if processing failed
-        """
-
-        results = await self.start_async(query)
-
+        """Synthesize responses from multiple models."""
+        results = await self.__start_async(query)
         if not results:
-            logger.error("No valid responses were generated")
-            raise ValueError("No responses were generated - check your models or API configuration")
-
+            logger.error("No valid responses were generated.")
+            raise ValueError("No responses were generated - check your models or API configuration.")
         # Format results for the synthesizer prompt
         results_txt = "\n\n".join([
-            f"Model: {result.name} \nResponse: {result.result}"
-            for result in results
+            f"Model: {result.name} \nResponse: {result.result}" for result in results
         ])
-
         user_content = f"""
             This is the original query:
             {query}
@@ -157,114 +132,84 @@ class SynthAgent:
             These are the results you need to synthesize:
             {results_txt}
         """
-
         logger.info(f"Synthesizing results with {SYNTHESIZER_MODEL}")
-
         try:
             response = await self.client.chat.completions.create(
                 model=SYNTHESIZER_MODEL,
                 messages=[
                     {
                         "role": "system",
-                        "content": """
-                        You are an advanced AI system designed to synthesize responses from multiple
-                        large language models (LLMs) to provide a cohesive, accurate, and comprehensive
-                        answer to user queries. Your goal is to leverage the strengths of each LLM,
-                        mitigate their weaknesses, and ensure the final response is clear, concise,
-                        and tailored to the user's intent. Follow these steps:
-
-                        1. **Query Analysis**: Carefully analyze the user's query to understand its
-                           intent, context, and specific requirements.
-                        2. **Response Aggregation**: Analyze the collected responses from the selected LLMs.
-                        3. **Synthesis Process**:
-                           - **Cross-Validation**: Compare responses for consistency, accuracy, and relevance.
-                           - **Conflict Resolution**: If discrepancies arise, prioritize responses based on factual accuracy.
-                           - **Enhancement**: Combine the best elements of each response.
-                        4. **Refinement**: Polish the synthesized response to ensure clarity, coherence, and
-                           alignment with the user's requested tone and style.
-                        5. **Output**: Deliver a single, seamless response that reflects the synthesized insights.
-                        """
+                        "content": (
+                            "You are an advanced AI system designed to synthesize responses from multiple "
+                            "large language models (LLMs) to provide a cohesive, accurate, and comprehensive "
+                            "answer to user queries. Your goal is to leverage the strengths of each LLM, "
+                            "mitigate their weaknesses, and ensure the final response is clear, concise, "
+                            "and tailored to the user's intent. Follow these steps:\n\n"
+                            "1. Query Analysis: Carefully analyze the user's query to understand its intent, context, and specific requirements.\n"
+                            "2. Response Aggregation: Analyze the collected responses from the selected LLMs.\n"
+                            "3. Synthesis Process:\n"
+                            "   - Cross-Validation: Compare responses for consistency, accuracy, and relevance.\n"
+                            "   - Conflict Resolution: If discrepancies arise, prioritize responses based on factual accuracy.\n"
+                            "   - Enhancement: Combine the best elements of each response.\n"
+                            "4. Refinement: Polish the synthesized response to ensure clarity, coherence, and alignment with the user's requested tone and style.\n"
+                            "5. Output: Deliver a single, seamless response that reflects the synthesized insights."
+                        )
                     },
-                    {
-                        "role": "user",
-                        "content": user_content,
-                    },
+                    {"role": "user", "content": user_content},
                 ],
                 stream=True,
             )
-
             return response
-
         except Exception as e:
             logger.error(f"Error during synthesis: {str(e)}")
-            # Return the best individual response as fallback
             return None
 
-    async def start_async(self, query: str) -> List[SynthModelResult]:
-        """Process all models concurrently
-
-        Args:
-            query: The user query to process
-
-        Returns:
-            A list of model results
-        """
+    async def __start_async(self, query: str) -> List[SynthModelResult]:
+        """Process all models concurrently."""
         if not self.models:
-            logger.error("No models configured")
+            logger.error("No models configured.")
             return []
-
-        # Create tasks for all models
         tasks = [
-            process_model(model, self.client, query)
-            for model in self.models
-        ]
-
-        # Execute tasks concurrently
+            process_model(model, self.client, query) 
+            for model in self.models 
+            for _ in range(model.runs)
+            ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
         processed_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Model {self.models[i].name} failed: {str(result)}")
             else:
                 processed_results.append(result)
-
-        logger.info(f"Completed processing {len(processed_results)}/{len(self.models)} models")
+        logger.info(f"Completed processing {len(processed_results)}/{len(self.models)} models.")
         return processed_results
 
+async def main(models: Optional[List[SynthModel]] = None) -> None:
+    """Main entry point for the application."""
+    validate_env()
 
+    api_key = OPENROUTER_API_KEY
 
-async def main():
-    """Main entry point for the application"""
+    if models is None:
+        models = get_default_models()
 
-    # Configure models
-    models = [
-        SynthModel(name="qwen/qwen3-30b-a3b:free"),
-        SynthModel(name="google/gemini-2.5-pro-exp-03-25"),
-        SynthModel(name="deepseek/deepseek-chat-v3-0324"),
-    ]
-
+    synth_agent = SynthAgent(models, api_key)
+    # Get user input
+    console.print(Panel("[bold cyan]Welcome to SynthAgent![/bold cyan]", title="SynthAgent"))
+    query = Prompt.ask("[bold green]Enter your query[/bold green]")
+    
+    if not query or len(query.strip()) < 5:
+        console.print(Panel("Query too short. Please provide a more detailed query.", style="red"))
+        return
+    
+    console.print(Panel("Processing your query. This may take a moment...", style="yellow"))
+    
     try:
-        synth_agent = SynthAgent(models)
-
-        # Get user input
-        query = input("Enter your query: ")
-        if not query or len(query.strip()) < 5:
-            print("Query too short. Please provide a more detailed query.")
-            return
-
-        print("\nProcessing your query. This may take a moment...\n")
-
-        # Process query
         synthesized_result = await synth_agent.synthesize_async(query)
-
         if synthesized_result:
-            print("\n==== Synthesized Result ====\n")
-
+            console.print(Panel("[bold green]==== Synthesized Result ====\n[/bold green]", style="green"))
             synthesized_content = ""
-
-            with Live(refresh_per_second=10) as live:
+            with Live(refresh_per_second=10, console=console) as live:
                 async for chunk in synthesized_result:
                     try:
                         if chunk.choices and len(chunk.choices) > 0:
@@ -272,18 +217,22 @@ async def main():
                             if hasattr(delta, "content") and delta.content is not None:
                                 content = delta.content
                                 synthesized_content += content
-                                # Update live
                                 live.update(Markdown(synthesized_content))
                     except Exception as e:
                         logger.warning(f"Error processing chunk: {str(e)}")
-
         else:
-            print("No results were synthesized. Please check your API configuration.")
-
+            console.print(Panel("No results were synthesized. Please check your API configuration.", style="red"))
     except Exception as e:
         logger.error(f"Application error: {str(e)}")
-        print(f"An error occurred: {str(e)}")
+        console.print(Panel(f"An error occurred: {str(e)}", style="bold red"))
+
+def cli():
+    """Command-line interface entry point."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Exiting SynthAgent. Goodbye![/bold yellow]")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    """Script entry point"""
-    asyncio.run(main())
+    cli()
