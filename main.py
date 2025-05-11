@@ -158,6 +158,7 @@ class SynthAgent:
                     {"role": "user", "content": user_content},
                 ],
                 stream=True,
+                reasoning_effort="high"
             )
             return response
         except Exception as e:
@@ -207,17 +208,24 @@ async def main(models: Optional[List[SynthModel]] = None) -> None:
     try:
         synthesized_result = await synth_agent.synthesize_async(query)
         if synthesized_result:
-            console.print(Panel("[bold green]==== Synthesized Result ====\n[/bold green]", style="green"))
+            reasoning_content = ""
             synthesized_content = ""
             with Live(refresh_per_second=10, console=console) as live:
                 async for chunk in synthesized_result:
                     try:
                         if chunk.choices and len(chunk.choices) > 0:
                             delta = chunk.choices[0].delta
+                            reasoning = getattr(delta, 'reasoning', None)
+                            if reasoning is not None:
+                                reasoning_content += reasoning
                             if hasattr(delta, "content") and delta.content is not None:
                                 content = delta.content
                                 synthesized_content += content
-                                live.update(Markdown(synthesized_content))
+                            # Format reasoning as a Markdown blockquote
+                            def to_blockquote(text):
+                                return '\n'.join(f'> {line}' for line in text.splitlines() if line.strip())
+                            display_content = f"### Reasoning\n{to_blockquote(reasoning_content)}\n\n---\n\n### Synthesized Response\n{synthesized_content}"
+                            live.update(Markdown(display_content))
                     except Exception as e:
                         logger.warning(f"Error processing chunk: {str(e)}")
         else:
